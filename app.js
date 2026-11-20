@@ -16,7 +16,6 @@ let playbackOwner = null;
 let toastTimer;
 let draggedVideo = null;
 let pendingFolderVideos = [];
-let setupRestorePending = false;
 const WINDOW_MINUTES = 90;
 const MONTH_MINUTES = 30 * 24 * 60;
 const PAGE_SIZE = 50;
@@ -383,7 +382,7 @@ function renderDemand(root = $("demand-view")) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
     empty.innerHTML = `<div class="eyebrow">YOUR COLLECTION, ON YOUR TERMS</div><h2>Something worth watching.</h2><p>Add your videos and pick a favorite.</p><button class="primary">Choose a video folder</button>`;
-    empty.querySelector("button").onclick = () => $("folder-input").click();
+    empty.querySelector("button").onclick = () => addLocation(true);
     root.append(empty);
     return;
   }
@@ -552,7 +551,7 @@ function chooseFolderImport(entries) {
       dialog.onclose = null;
       try {
         if (["folder", "individual"].includes(dialog.returnValue)) await importFiles(entries, dialog.returnValue === "individual", false);
-        resolve();
+        resolve(dialog.returnValue);
       } catch (error) { reject(error); }
     };
     dialog.showModal();
@@ -713,21 +712,18 @@ function changeProgram(direction) {
 
 function playNextProgram() { changeProgram(1); }
 
-$("add-folder").onclick = $("empty-add").onclick = () => $("folder-input").click();
-$("add-files").onclick = () => $("files-input").click();
+$("add-folder").onclick = $("empty-add").onclick = () => addLocation(true);
+$("add-files").onclick = () => addLocation(false);
 for (const input of [$("folder-input"), $("files-input")]) {
   input.onchange = async () => {
     const files = Array.from(input.files);
     input.value = "";
     try {
-      if (setupRestorePending) {
-        setupRestorePending = false;
-        await importFiles(files, false, true);
-        toast("Setup restored. Matching videos were added to their saved channels.");
-      } else if (input === $("folder-input")) await chooseFolderImport(files);
+      if (files.some(isVideo)) unrememberedSources = true;
+      if (input === $("folder-input")) await chooseFolderImport(files);
       else await importFiles(files, true);
     }
-    catch (error) { setupRestorePending = false; toast("Import could not finish. Please try again."); }
+    catch (error) { toast("Import could not finish. Please try again."); }
   };
 }
 $("guide-tab").onclick = () => setView("guide");
@@ -970,51 +966,27 @@ window.addEventListener("drop", async (event) => {
   $("drop-overlay").hidden = true;
   const items = Array.from(event.dataTransfer.items || []);
   const fallback = Array.from(event.dataTransfer.files);
+  // Request reusable handles during the drop gesture, before traversing entries.
+  const handlePromises = items.filter(item => item.kind === "file").map(item => item.getAsFileSystemHandle ? item.getAsFileSystemHandle().catch(() => null) : Promise.resolve(null));
   const roots = items.map((item) => item.webkitGetAsEntry ? item.webkitGetAsEntry() : null).filter(Boolean);
   try {
     const entries = roots.length ? await readDroppedEntries(roots) : fallback;
     const hasFolders = roots.some((entry) => entry.isDirectory) || entries.some((entry) => (entry.path || entry.webkitRelativePath || "").includes("/"));
-    if (hasFolders) await chooseFolderImport(entries);
-    else await importFiles(entries, true);
+    const mode = hasFolders ? await chooseFolderImport(entries) : "individual";
+    if (!hasFolders) await importFiles(entries, true);
+    if (["folder", "individual"].includes(mode)) {
+      const handles = await Promise.all(handlePromises);
+      if (!handles.length || handles.some(handle => !handle)) unrememberedSources = true;
+      for (const handle of handles.filter(Boolean)) {
+        try { await rememberLocation(handle, mode === "individual"); }
+        catch (error) { unrememberedSources = true; toast(error.message); }
+      }
+    }
   } catch (error) {
     toast("Could not read this folder. Try the Add video folder button instead.");
   }
 });
 
-
-function saveCurrentSetup() {
-  const videos = channels.flatMap((channel) => channel.videos.map((video) => ({
-    path: video.path, name: video.file.name, size: video.file.size, lastModified: video.file.lastModified,
-    channelPath: channel.path, channelName: channel.name
-  })));
-  if (!videos.length) { toast("Add videos before saving your setup."); return; }
-  const manifest = { type: "locatube-setup", version: 1, savedAt: new Date().toISOString(), videos };
-  const url = URL.createObjectURL(new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" }));
-  const link = document.createElement("a"); link.href = url; link.download = "locatube-setup.json";
-  document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
-  toast(`Saved setup for ${videos.length.toLocaleString()} videos. Load it later and select the original media to reconnect.`);
-}
-
-function loadCurrentSetup(file) {
-  if (!file) return;
-  if (file.size > 10 * 1024 * 1024) { toast("Choose a setup file smaller than 10 MB."); return; }
-  file.text().then((text) => {
-    const data = JSON.parse(text);
-    if (!data || data.type !== "locatube-setup" || data.version !== 1 || !Array.isArray(data.videos) || data.videos.length > 50000) throw new Error("Choose a valid locatube setup file.");
-    for (const item of data.videos) {
-      if (!item || typeof item.path !== "string" || !item.path || item.path.length > 6000 || typeof item.name !== "string" || !isVideo({ name: item.name }) || !Number.isSafeInteger(item.size) || item.size < 0 || !Number.isSafeInteger(item.lastModified) || item.lastModified < 0 || typeof item.channelPath !== "string" || !item.channelPath || typeof item.channelName !== "string" || !item.channelName) throw new Error("The setup contains an invalid media reference.");
-    }
-    let restored = 0;
-    for (const item of data.videos) {
-      const key = `${item.path}|${item.size}|${item.lastModified}`;
-      try { localStorage.setItem("airwave:folder:" + key, JSON.stringify({ path: item.channelPath, name: item.channelName })); restored++; }
-      catch (error) { break; }
-    }
-    setupRestorePending = restored > 0;
-    if (setupRestorePending) toast("Setup loaded. Choose Add folder or Add videos and select the original media to restore your lineup.");
-    else toast("This setup has no videos to relink.");
-  }).catch((error) => toast(error.message || "Could not read this setup file."));
-}
 
 $("save-setup").onclick = saveCurrentSetup;
 $("load-setup").onclick = () => $("setup-input").click();
@@ -1025,8 +997,8 @@ $("save-app").onclick = async () => {
   button.disabled = true;
   try {
     const fetchText = async (path) => { const response = await fetch(path); if (!response.ok) throw new Error("Download failed"); return response.text(); };
-    const [html, css, favoritesJS, viewsJS, appJS] = await Promise.all([fetchText("index.html"), fetchText("style.css"), fetchText("favorites.js"), fetchText("views.js"), fetchText("app.js")]);
-    const js = [favoritesJS, viewsJS, appJS].join(String.fromCharCode(10) + ";" + String.fromCharCode(10));
+    const [html, css, favoritesJS, viewsJS, sourcesJS, appJS] = await Promise.all([fetchText("index.html"), fetchText("style.css"), fetchText("favorites.js"), fetchText("views.js"), fetchText("sources.js"), fetchText("app.js")]);
+    const js = [favoritesJS, viewsJS, sourcesJS, appJS].join(String.fromCharCode(10) + ";" + String.fromCharCode(10));
     const page = new DOMParser().parseFromString(html, "text/html");
     const style = page.createElement("style");
     style.textContent = css;
@@ -1045,13 +1017,41 @@ $("save-app").onclick = async () => {
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
-    toast("Open locatube.html anytime, even offline. Select your video folders again when you reopen it.");
+    toast("Open locatube.html anytime, even offline. Add your locations once there, then use Save current setup and Load setup.");
   } catch (error) {
     toast("Could not save the offline app. Please try again while connected.");
   } finally { button.disabled = false; }
 };
 
+// Home icon at the top of every menu (dialog): takes the user to the home page below.
+const HOME_URL = "https://jackrose2029.github.com/start";
+function goHome() {
+  document.querySelectorAll("dialog[open]").forEach((dialog) => dialog.close());
+  window.location.href = HOME_URL;
+}
+function addHomeButtons() {
+  document.querySelectorAll("dialog").forEach((dialog) => {
+    if (dialog.querySelector(".home-link")) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "home-link";
+    button.title = "Home";
+    button.setAttribute("aria-label", "Home");
+    button.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v9.5h4.5V14h4v5.5h4.5V10"/></svg>';
+    button.onclick = goHome;
+    const top = dialog.querySelector(".player-top");
+    if (top) top.prepend(button);
+    else {
+      const bar = document.createElement("div");
+      bar.className = "menu-home-bar";
+      bar.append(button);
+      (dialog.querySelector("form") || dialog).prepend(bar);
+    }
+  });
+}
+
 function initialize() {
+  addHomeButtons();
   initializeFavorites();
   initializeViews();
   if (document.getElementById("offline-code")) $("save-app").hidden = true;
